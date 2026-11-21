@@ -1,16 +1,42 @@
 use std::arch::x86_64::*;
 use std::sync::Mutex;
 
-const BLK: usize = 1 << 16;
+const BLK: usize = 1 << 14;
 const SLAB: usize = 1 << 26;
 
 struct Pool {
     free: Vec<usize>,
+    ready: Vec<usize>,
+    used: usize,
     cur: usize,
     end: usize,
 }
 
-static POOL: Mutex<Pool> = Mutex::new(Pool { free: Vec::new(), cur: 0, end: 0 });
+static POOL: Mutex<Pool> = Mutex::new(Pool { free: Vec::new(), ready: Vec::new(), used: 0, cur: 0, end: 0 });
+
+extern "C" {
+    fn sched_setscheduler(pid: i32, pol: i32, prm: *const i32) -> i32;
+}
+
+pub fn prefault<F: FnOnce() -> usize + Send + 'static>(need: F) {
+    std::thread::spawn(move || {
+        unsafe { sched_setscheduler(0, 5, &0) };
+        let n = need().div_ceil(SLAB);
+        loop {
+            {
+                let p = POOL.lock().unwrap();
+                if p.used + p.ready.len() >= n {
+                    break;
+                }
+            }
+            let s = unsafe { crate::alloc::map(SLAB) };
+            for o in (0..SLAB).step_by(1 << 21) {
+                unsafe { s.add(o).write_volatile(0) };
+            }
+            POOL.lock().unwrap().ready.push(s as usize);
+        }
+    });
+}
 
 fn get() -> usize {
     let mut p = POOL.lock().unwrap();
@@ -18,7 +44,11 @@ fn get() -> usize {
         return b;
     }
     if p.cur == p.end {
-        p.cur = unsafe { crate::alloc::map(SLAB) } as usize;
+        p.used += 1;
+        p.cur = match p.ready.pop() {
+            Some(r) => r,
+            None => unsafe { crate::alloc::map(SLAB) as usize },
+        };
         p.end = p.cur + SLAB;
     }
     p.cur += BLK;

@@ -339,6 +339,10 @@ fn map_dir(dir: &std::path::Path) -> Vec<Mapped> {
         .collect()
 }
 
+fn dsize(d: &std::path::Path) -> usize {
+    std::fs::read_dir(d).map_or(0, |rd| rd.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len() as usize).sum())
+}
+
 fn chunks(files: &[Mapped], tag: u8, out: &mut Vec<(u8, usize, usize, usize)>) {
     for (fi, m) in files.iter().enumerate() {
         let b = m.bytes();
@@ -494,13 +498,15 @@ pub struct UserRows {
 
 fn main() {
     let t0 = std::time::Instant::now();
+    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let pd = data.clone();
+    blk::prefault(move || dsize(&pd.join("events")) / 3 + dsize(&pd.join("clicks")) / 2);
     let tr = std::env::var("SS_T").is_ok();
     let lap = |n: &str| {
         if tr {
             eprintln!("{:>8.1}ms {}", t0.elapsed().as_secs_f64() * 1e3, n)
         }
     };
-    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let outdir = std::path::PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let nt: usize = std::env::var("NCPU").ok().and_then(|x| x.parse().ok()).unwrap_or(8).max(1);
 
