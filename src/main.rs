@@ -150,6 +150,76 @@ struct Table {
     kv: Vec<u64>,
     mask: usize,
 }
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Bk([u64; 8]);
+
+struct BTable {
+    k: Vec<Bk>,
+    v: Vec<Bk>,
+    o: Vec<u8>,
+    m: usize,
+}
+
+impl BTable {
+    fn reset(&mut self, n: usize) {
+        let nb = (n / 2).next_power_of_two().max(2);
+        self.k.clear();
+        self.k.resize(nb, Bk([0; 8]));
+        self.v.clear();
+        self.v.resize(nb, Bk([0; 8]));
+        self.o.clear();
+        self.o.resize(nb, 0);
+        self.m = nb - 1;
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let mut b = (mix(k) >> 20) as usize & self.m;
+        loop {
+            for j in 0..8 {
+                let s = self.k[b].0[j];
+                if s == 0 || s == k {
+                    self.k[b].0[j] = k;
+                    self.v[b].0[j] = v;
+                    return;
+                }
+            }
+            self.o[b] = 1;
+            b = (b + 1) & self.m;
+        }
+    }
+    #[inline(always)]
+    fn map(&self, k: u64) -> u64 {
+        use std::arch::x86_64::*;
+        let b = (mix(k) >> 20) as usize & self.m;
+        unsafe {
+            let p = self.k.as_ptr().add(b) as *const __m256i;
+            let kk = _mm256_set1_epi64x(k as i64);
+            let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p), kk))) as u32;
+            let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p.add(1)), kk))) as u32;
+            let m = m0 | m1 << 4;
+            let v = *(self.v.as_ptr().add(b) as *const u64).add(((m | 0x100).trailing_zeros() & 7) as usize);
+            if *self.o.get_unchecked(b) != 0 && m == 0 {
+                return self.slow(k, b);
+            }
+            if m != 0 { v } else { k }
+        }
+    }
+    #[cold]
+    fn slow(&self, k: u64, mut b: usize) -> u64 {
+        loop {
+            for j in 0..8 {
+                if self.k[b].0[j] == k {
+                    return self.v[b].0[j];
+                }
+            }
+            if self.o[b] == 0 {
+                return k;
+            }
+            b = (b + 1) & self.m;
+        }
+    }
+}
+
 impl Table {
     fn new(n: usize) -> Table {
         let cap = (n * 2).next_power_of_two().max(16);
@@ -850,17 +920,13 @@ fn main() {
     let resolved: Vec<(Vec<Seq<PRec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
         let mut eo: Vec<Seq<PRec>> = (0..np3).map(|_| Seq::new()).collect();
         let mut co: Vec<Seq<CRec>> = (0..np3).map(|_| Seq::new()).collect();
-        let mut tb = Table { kv: Vec::new(), mask: 0 };
+        let mut tb = BTable { k: Vec::new(), v: Vec::new(), o: Vec::new(), m: 0 };
         loop {
             let u = next.fetch_add(1, Relaxed);
             if u >= np3 {
                 break;
             }
-            let n: usize = lparts.iter().map(|x| x[u].len()).sum();
-            let c = (n * 2).next_power_of_two().max(16);
-            tb.kv.clear();
-            tb.kv.resize(2 * c, 0);
-            tb.mask = c - 1;
+            tb.reset(lparts.iter().map(|x| x[u].len()).sum());
             for x in &lparts {
                 for &(k, v) in &x[u] {
                     tb.insert(k, v);
@@ -875,7 +941,7 @@ fn main() {
                     if l != 0 {
                         continue;
                     }
-                    let person = tb.get(r.user).unwrap_or(r.user);
+                    let person = tb.map(r.user);
                     eo[(mix(person) >> (64 - P3_BITS)) as usize].push(PRec { person, ts: r.ts, meta: r.meta });
                 }
             }
@@ -883,7 +949,7 @@ fn main() {
             for x in &cs {
                 for r in x.iter() {
                     let mut r = *r;
-                    r.person = tb.get(r.person).unwrap_or(r.person);
+                    r.person = tb.map(r.person);
                     co[(mix(r.person) >> (64 - P3_BITS)) as usize].push(r);
                 }
             }
