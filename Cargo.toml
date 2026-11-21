@@ -1,11 +1,21 @@
 [package]
-name = "ss"
+name = "pipeline"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [[bin]]
-name = "ss"
+name = "pipeline"
 path = "src/main.rs"
+
+[features]
+stats = []
+knobs = []
+testkeys = []
+pmu = []
+tl = []
+
+[dependencies]
 
 [profile.release]
 opt-level = 3
@@ -13,4 +23,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
-
