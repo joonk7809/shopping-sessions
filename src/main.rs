@@ -21,7 +21,6 @@ const P1_BITS: u32 = 10;
 const P3_BITS: u32 = 10;
 const CHUNK: usize = 2 << 20;
 const FB: u64 = 1 << 63;
-const INVALID: u32 = u32::MAX;
 
 static INTERN: Mutex<Option<(HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>> = Mutex::new(None);
 
@@ -438,11 +437,17 @@ fn small_csv(path: &std::path::Path) -> Vec<[Vec<u8>; 2]> {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
-struct ERec {
+#[repr(C)]
+struct DRec {
     eid: u64,
-    person: u64,
     ingest: i32,
+    pos: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct URec {
+    user: u64,
     ts: u32,
     meta: u32,
 }
@@ -650,9 +655,14 @@ fn main() {
     chunks(&cfiles, 1, &mut ch);
     let np1 = 1usize << P1_BITS;
     let next = AtomicUsize::new(0);
-    let parsed: Vec<(Vec<Seq<ERec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
-        let mut ep: Vec<Seq<ERec>> = (0..np1).map(|_| Seq::new()).collect();
-        let mut ew = Wc::new(np1, ERec { eid: 0, person: 0, ingest: 0, ts: 0, meta: 0 });
+    let kb = 32 - (nt * np3 * 2).next_power_of_two().trailing_zeros();
+    let gseg = AtomicU32::new(0);
+    let parsed: Vec<(Vec<Seq<DRec>>, Vec<Seq<URec>>, Vec<Seq<CRec>>, Vec<(Vec<u32>, u32)>)> = run(nt, |_| {
+        let mut sg: Vec<(Vec<u32>, u32)> = vec![(Vec::new(), 1 << kb); np3];
+        let mut ep: Vec<Seq<DRec>> = (0..np1).map(|_| Seq::new()).collect();
+        let mut ew = Wc::new(np1, DRec { eid: 0, ingest: 0, pos: 0 });
+        let mut up: Vec<Seq<URec>> = (0..np3).map(|_| Seq::new()).collect();
+        let mut uw = Wc::new(np3, URec { user: 0, ts: 0, meta: 0 });
         let mut cp: Vec<Seq<CRec>> = (0..np3).map(|_| Seq::new()).collect();
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -670,7 +680,7 @@ fn main() {
                     }
                     let eid = fenc(end, f[0]);
                     let g = f[3];
-                    let mut r = ERec { eid, person: 0, ingest: i32::MAX, ts: INVALID, meta: 0 };
+                    let mut r = DRec { eid, ingest: i32::MAX, pos: u32::MAX };
                     let ing = if g.len() == 20 && g[19] == b'Z' {
                         let sec = unsafe { fast::ing_p(g.as_ptr()) };
                         r.ingest = (sec - wstart / 1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
@@ -713,9 +723,18 @@ fn main() {
                                     }
                                 }
                                 if ok {
-                                    r.ts = (t - base) as u32;
-                                    r.meta = meta;
-                                    r.person = fenc(end, f[1]);
+                                    let u = fenc(end, f[1]);
+                                    let q = (mix(u) >> (64 - P3_BITS)) as usize;
+                                    let g = &mut sg[q];
+                                    if g.1 == 1 << kb {
+                                        let z = gseg.fetch_add(1, Relaxed);
+                                        assert!(z >> (32 - kb) == 0);
+                                        g.0.push(z);
+                                        g.1 = 0;
+                                    }
+                                    r.pos = g.0[g.0.len() - 1] << kb | g.1;
+                                    g.1 += 1;
+                                    uw.push(q, URec { user: u, ts: (t - base) as u32, meta }, &mut up);
                                 }
                             }
                         }
@@ -741,24 +760,45 @@ fn main() {
             }
         }
         ew.flush(&mut ep);
-        (ep, cp)
+        uw.flush(&mut up);
+        (ep, up, cp, sg)
     });
-    let mut ept: Vec<Mutex<Vec<Seq<ERec>>>> = (0..np1).map(|_| Mutex::new(Vec::new())).collect();
-    let mut cpt: Vec<Mutex<Vec<Seq<CRec>>>> = (0..np3).map(|_| Mutex::new(Vec::new())).collect();
-    for (ep, cp) in parsed {
+    let mut segs = Vec::new();
+    let mut ept: Vec<Mutex<Vec<Seq<DRec>>>> = (0..np1).map(|_| Mutex::new(Vec::new())).collect();
+    let mut upt: Vec<Mutex<(Vec<Seq<URec>>, Vec<Seq<CRec>>)>> = (0..np3).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
+    for (ep, up, cp, sg) in parsed {
+        segs.push(sg);
         for (p, x) in ep.into_iter().enumerate() {
             ept[p].get_mut().unwrap().push(x);
         }
+        for (u, x) in up.into_iter().enumerate() {
+            upt[u].get_mut().unwrap().0.push(x);
+        }
         for (u, x) in cp.into_iter().enumerate() {
-            cpt[u].get_mut().unwrap().push(x);
+            upt[u].get_mut().unwrap().1.push(x);
         }
     }
     lap("parse");
-
+    let mut cbase = vec![0usize; gseg.load(Relaxed) as usize];
+    let mut sbase = vec![0usize; nt * np3];
+    let mut nb = 0;
+    for u in 0..np3 {
+        for (t, sg) in segs.iter().enumerate() {
+            sbase[u * nt + t] = nb;
+            for &z in &sg[u].0 {
+                cbase[z as usize] = nb;
+                nb += 1 << kb;
+            }
+            if let Some(&z) = sg[u].0.last() {
+                nb = cbase[z as usize] + sg[u].1 as usize;
+            }
+        }
+    }
+    let lose: Vec<AtomicU64> = (0..nb / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    let bit = |pos: u32| cbase[(pos >> kb) as usize] + (pos & ((1 << kb) - 1)) as usize;
     let next = AtomicUsize::new(0);
-    let pparts: Vec<Vec<Seq<PRec>>> = run(nt, |_| {
-        let mut out: Vec<Seq<PRec>> = (0..np3).map(|_| Seq::new()).collect();
-        let mut flat: Vec<ERec> = Vec::new();
+    run(nt, |_| {
+        let mut flat: Vec<DRec> = Vec::new();
         let mut ix: Vec<u32> = Vec::new();
         loop {
             let p = next.fetch_add(1, Relaxed);
@@ -788,31 +828,23 @@ fn main() {
                     }
                     let s = s as usize;
                     if flat[s].eid == eid {
-                        if flat[k].ingest < flat[s].ingest {
+                        let l = if flat[k].ingest < flat[s].ingest {
                             ix[i] = k as u32;
-                            flat[s].ts = INVALID;
+                            flat[s].pos
                         } else {
-                            flat[k].ts = INVALID;
+                            flat[k].pos
+                        };
+                        if l != u32::MAX {
+                            let b = bit(l);
+                            lose[b >> 6].fetch_or(1 << (b & 63), Relaxed);
                         }
                         break;
                     }
                     i = (i + 1) & m;
                 }
             }
-            for r in flat.iter() {
-                if r.ts != INVALID {
-                    out[(mix(r.person) >> (64 - P3_BITS)) as usize].push(PRec { person: r.person, ts: r.ts, meta: r.meta });
-                }
-            }
         }
-        out
     });
-    let mut ppt: Vec<Mutex<Vec<Seq<PRec>>>> = (0..np3).map(|_| Mutex::new(Vec::new())).collect();
-    for pp in pparts {
-        for (u, x) in pp.into_iter().enumerate() {
-            ppt[u].get_mut().unwrap().push(x);
-        }
-    }
     lap("dedup");
     let next = AtomicUsize::new(0);
     let resolved: Vec<(Vec<Seq<PRec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
@@ -834,13 +866,17 @@ fn main() {
                     tb.insert(k, v);
                 }
             }
-            let ps = std::mem::take(&mut *ppt[u].lock().unwrap());
-            let cs = std::mem::take(&mut *cpt[u].lock().unwrap());
-            for x in &ps {
+            let (ps, cs) = std::mem::take(&mut *upt[u].lock().unwrap());
+            for (t, x) in ps.iter().enumerate() {
+                let mut b = sbase[u * nt + t];
                 for r in x.iter() {
-                    let mut r = *r;
-                    r.person = tb.get(r.person).unwrap_or(r.person);
-                    eo[(mix(r.person) >> (64 - P3_BITS)) as usize].push(r);
+                    let l = lose[b >> 6].load(Relaxed) >> (b & 63) & 1;
+                    b += 1;
+                    if l != 0 {
+                        continue;
+                    }
+                    let person = tb.get(r.user).unwrap_or(r.user);
+                    eo[(mix(person) >> (64 - P3_BITS)) as usize].push(PRec { person, ts: r.ts, meta: r.meta });
                 }
             }
             drop(ps);
