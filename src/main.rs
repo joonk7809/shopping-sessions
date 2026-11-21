@@ -771,8 +771,8 @@ fn main() {
             let m = cap - 1;
             ix.clear();
             ix.resize(cap, u32::MAX);
-            for (k, r) in flat.iter().enumerate() {
-                let eid = r.eid;
+            for k in 0..flat.len() {
+                let eid = flat[k].eid;
                 let mut i = (mix(eid) as usize) & m;
                 loop {
                     let s = ix[i];
@@ -780,22 +780,22 @@ fn main() {
                         ix[i] = k as u32;
                         break;
                     }
-                    let o = &flat[s as usize];
-                    if o.eid == eid {
-                        if r.ingest < o.ingest {
+                    let s = s as usize;
+                    if flat[s].eid == eid {
+                        if flat[k].ingest < flat[s].ingest {
                             ix[i] = k as u32;
+                            flat[s].ts = INVALID;
+                        } else {
+                            flat[k].ts = INVALID;
                         }
                         break;
                     }
                     i = (i + 1) & m;
                 }
             }
-            for &s in ix.iter() {
-                if s != u32::MAX {
-                    let r = flat[s as usize];
-                    if r.ts != INVALID {
-                        out[(mix(r.person) >> (64 - P3_BITS)) as usize].push(PRec { person: r.person, ts: r.ts, meta: r.meta });
-                    }
+            for r in flat.iter() {
+                if r.ts != INVALID {
+                    out[(mix(r.person) >> (64 - P3_BITS)) as usize].push(PRec { person: r.person, ts: r.ts, meta: r.meta });
                 }
             }
         }
