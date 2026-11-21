@@ -19,7 +19,7 @@ fn span(n: usize) -> usize {
     (n + HP - 1) & !(HP - 1)
 }
 
-unsafe fn map(n: usize) -> *mut u8 {
+pub unsafe fn map(n: usize) -> *mut u8 {
     let r = mmap(null_mut(), n + HP, 3, 0x22, -1, 0);
     if r as isize == -1 {
         return null_mut();

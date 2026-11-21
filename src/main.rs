@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
+use blk::Seq;
 
 mod alloc;
+mod blk;
 mod fast;
 mod out;
 mod pq;
@@ -370,6 +372,46 @@ fn lines<'a, F: FnMut(&'a [u8])>(b: &'a [u8], mut f: F) {
     }
 }
 
+fn rsort<T: Copy, K: Fn(&T) -> u32>(a: &mut Vec<T>, b: &mut Vec<T>, key: K) {
+    let mut h = [[0u32; 2048]; 2];
+    for r in a.iter() {
+        let k = key(r);
+        h[0][((k >> 10) & 2047) as usize] += 1;
+        h[1][(k >> 21) as usize] += 1;
+    }
+    b.clear();
+    b.reserve(a.len());
+    unsafe { b.set_len(a.len()) };
+    for p in 0..2 {
+        let mut o = 0u32;
+        for x in h[p].iter_mut() {
+            let c = *x;
+            *x = o;
+            o += c;
+        }
+        let sh = 10 + p as u32 * 11;
+        for r in a.iter() {
+            let d = ((key(r) >> sh) & 2047) as usize;
+            unsafe { *b.get_unchecked_mut(h[p][d] as usize) = *r };
+            h[p][d] += 1;
+        }
+        std::mem::swap(a, b);
+    }
+}
+
+fn isort<T: Copy, K: Fn(&T) -> u32>(a: &mut [T], key: K) {
+    for i in 1..a.len() {
+        let x = a[i];
+        let k = key(&x);
+        let mut j = i;
+        while j > 0 && key(&a[j - 1]) > k {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = x;
+    }
+}
+
 fn run<T: Send, F: Fn(usize) -> T + Sync>(nt: usize, f: F) -> Vec<T> {
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt).map(|t| { let f = &f; sc.spawn(move || f(t)) }).collect();
@@ -502,7 +544,6 @@ fn main() {
     let efiles = map_dir(&data.join("events"));
     let cfiles = map_dir(&data.join("clicks"));
     let lbytes: usize = lfiles.iter().map(|m| m.1).sum();
-    let ebytes: usize = efiles.iter().map(|m| m.1).sum();
     let mut lch = Vec::new();
     chunks(&lfiles, 0, &mut lch);
     let cap = (lbytes / 10 + 64).next_power_of_two();
@@ -602,21 +643,21 @@ fn main() {
     chunks(&efiles, 0, &mut ch);
     chunks(&cfiles, 1, &mut ch);
     let np1 = 1usize << P1_BITS;
-    let est = ebytes / 80 / nt / np1 + 64;
     let next = AtomicUsize::new(0);
-    let parsed: Vec<(Vec<Vec<ERec>>, Vec<Vec<CRec>>)> = run(nt, |_| {
-        let mut ep: Vec<Vec<ERec>> = (0..np1).map(|_| Vec::with_capacity(est)).collect();
-        let mut cp: Vec<Vec<CRec>> = (0..np3).map(|_| Vec::new()).collect();
+    let parsed: Vec<(Vec<Seq<ERec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
+        let mut ep: Vec<Seq<ERec>> = (0..np1).map(|_| Seq::new()).collect();
+        let mut cp: Vec<Seq<CRec>> = (0..np3).map(|_| Seq::new()).collect();
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= ch.len() {
                 break;
             }
             let (tag, fi, s, e) = ch[i];
+            let whole = if tag == 0 { efiles[fi].bytes() } else { cfiles[fi].bytes() };
+            let fb = &whole[s..e];
+            let end = whole.as_ptr() as usize + whole.len();
             if tag == 0 {
-                let fb = efiles[fi].bytes();
-                let end = fb.as_ptr() as usize + fb.len();
-                scan::tokenize::<7, _>(&fb[s..e], |f| {
+                scan::tokenize::<7, _>(fb, |f| {
                     if f[0].is_empty() {
                         return;
                     }
@@ -667,9 +708,7 @@ fn main() {
                     ep[(mix(eid) >> (64 - P1_BITS)) as usize].push(r);
                 });
             } else {
-                let fb = cfiles[fi].bytes();
-                let end = fb.as_ptr() as usize + fb.len();
-                scan::tokenize::<4, _>(&fb[s..e], |f4| {
+                scan::tokenize::<4, _>(fb, |f4| {
                     if f4[0].is_empty() || f4[1].is_empty() {
                         return;
                     }
@@ -688,11 +727,21 @@ fn main() {
         }
         (ep, cp)
     });
+    let mut ept: Vec<Mutex<Vec<Seq<ERec>>>> = (0..np1).map(|_| Mutex::new(Vec::new())).collect();
+    let mut cpt: Vec<Mutex<Vec<Seq<CRec>>>> = (0..np3).map(|_| Mutex::new(Vec::new())).collect();
+    for (ep, cp) in parsed {
+        for (p, x) in ep.into_iter().enumerate() {
+            ept[p].get_mut().unwrap().push(x);
+        }
+        for (u, x) in cp.into_iter().enumerate() {
+            cpt[u].get_mut().unwrap().push(x);
+        }
+    }
     lap("parse");
 
     let next = AtomicUsize::new(0);
-    let pparts: Vec<Vec<Vec<PRec>>> = run(nt, |_| {
-        let mut out: Vec<Vec<PRec>> = (0..np3).map(|_| Vec::new()).collect();
+    let pparts: Vec<Vec<Seq<PRec>>> = run(nt, |_| {
+        let mut out: Vec<Seq<PRec>> = (0..np3).map(|_| Seq::new()).collect();
         let mut tk: Vec<u64> = Vec::new();
         let mut tv: Vec<(i32, u32, u32)> = Vec::new();
         let mut win: Vec<PRec> = Vec::new();
@@ -701,15 +750,16 @@ fn main() {
             if p >= np1 {
                 break;
             }
-            let n: usize = parsed.iter().map(|x| x.0[p].len()).sum();
+            let parts = std::mem::take(&mut *ept[p].lock().unwrap());
+            let n: usize = parts.iter().map(|x| x.len()).sum();
             let cap = (n * 2).next_power_of_two().max(16);
             let m = cap - 1;
             tk.clear();
             tk.resize(cap, 0);
             tv.clear();
             tv.resize(cap, (0, 0, 0));
-            for (t, x) in parsed.iter().enumerate() {
-                for (j, r) in x.0[p].iter().enumerate() {
+            for (t, x) in parts.iter().enumerate() {
+                for (j, r) in x.iter().enumerate() {
                     let eid = r.eid;
                     let ing = r.ingest;
                     let mut i = (mix(eid) as usize) & m;
@@ -733,23 +783,30 @@ fn main() {
             for i in 0..cap {
                 if tk[i] != 0 {
                     let (_, t, j) = tv[i];
-                    let r = parsed[t as usize].0[p][j as usize];
+                    let r = parts[t as usize].at(j as usize);
                     if r.ts != INVALID {
                         win.push(PRec { person: r.person, ts: r.ts, meta: r.meta });
                     }
                 }
             }
+            drop(parts);
             for w in win.drain(..) {
                 out[(mix(w.person) >> (64 - P3_BITS)) as usize].push(w);
             }
         }
         out
     });
+    let mut ppt: Vec<Mutex<Vec<Seq<PRec>>>> = (0..np3).map(|_| Mutex::new(Vec::new())).collect();
+    for pp in pparts {
+        for (u, x) in pp.into_iter().enumerate() {
+            ppt[u].get_mut().unwrap().push(x);
+        }
+    }
     lap("dedup");
     let next = AtomicUsize::new(0);
-    let resolved: Vec<(Vec<Vec<PRec>>, Vec<Vec<CRec>>)> = run(nt, |_| {
-        let mut eo: Vec<Vec<PRec>> = (0..np3).map(|_| Vec::new()).collect();
-        let mut co: Vec<Vec<CRec>> = (0..np3).map(|_| Vec::new()).collect();
+    let resolved: Vec<(Vec<Seq<PRec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
+        let mut eo: Vec<Seq<PRec>> = (0..np3).map(|_| Seq::new()).collect();
+        let mut co: Vec<Seq<CRec>> = (0..np3).map(|_| Seq::new()).collect();
         let mut tb = Table { kv: Vec::new(), mask: 0 };
         loop {
             let u = next.fetch_add(1, Relaxed);
@@ -766,15 +823,18 @@ fn main() {
                     tb.insert(k, v);
                 }
             }
-            for x in &pparts {
-                for r in &x[u] {
+            let ps = std::mem::take(&mut *ppt[u].lock().unwrap());
+            let cs = std::mem::take(&mut *cpt[u].lock().unwrap());
+            for x in &ps {
+                for r in x.iter() {
                     let mut r = *r;
                     r.person = tb.get(r.person).unwrap_or(r.person);
                     eo[(mix(r.person) >> (64 - P3_BITS)) as usize].push(r);
                 }
             }
-            for x in &parsed {
-                for r in &x.1[u] {
+            drop(ps);
+            for x in &cs {
+                for r in x.iter() {
                     let mut r = *r;
                     r.person = tb.get(r.person).unwrap_or(r.person);
                     co[(mix(r.person) >> (64 - P3_BITS)) as usize].push(r);
@@ -783,22 +843,33 @@ fn main() {
         }
         (eo, co)
     });
+    let mut rt: Vec<Mutex<(Vec<Seq<PRec>>, Vec<Seq<CRec>>)>> = (0..np3).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
+    for (eo, co) in resolved {
+        for (q, (a, b)) in eo.into_iter().zip(co).enumerate() {
+            let r = rt[q].get_mut().unwrap();
+            r.0.push(a);
+            r.1.push(b);
+        }
+    }
     lap("resolve");
 
     let tab = interned();
     let ncat = catnames.len();
     let mut order: Vec<usize> = (0..np3).collect();
-    let sizes: Vec<usize> = (0..np3).map(|q| resolved.iter().map(|x| x.0[q].len()).sum()).collect();
+    let sizes: Vec<usize> = rt.iter_mut().map(|r| r.get_mut().unwrap().0.iter().map(|x| x.len()).sum()).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
     let next = AtomicUsize::new(0);
-    let results: Vec<(UserRows, Vec<[u64; 4]>)> = run(nt, |_| {
+    let results: Vec<(UserRows, Vec<[u32; 2]>, Vec<u64>, Vec<u32>)> = run(nt, |_| {
         let mut ur = UserRows { uid: Vec::new(), uoff: vec![0], day: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new() };
-        let mut camp = vec![[0u64; 4]; ncamp * ndays];
-        let mut ev: Vec<PRec> = Vec::new();
+        let mut camp = vec![[0u32; 2]; ncamp * ndays];
+        let mut casst = vec![0u32; ncamp * ndays];
+        let mut crev = vec![0u64; ncamp * ndays];
+        let mut ev: Vec<(u32, u32)> = Vec::new();
         let mut cl: Vec<CRec> = Vec::new();
         let mut catrev = vec![0u64; ncat];
         let mut starts: Vec<u32> = Vec::new();
-        let mut dstart: Vec<usize> = vec![0; ndays + 1];
+        let mut ad: Vec<(u32, u32)> = Vec::new();
+        let mut sdi: Vec<u32> = Vec::new();
         let mut lo: Vec<u32> = vec![0; ncamp];
         let mut hi: Vec<u32> = vec![0; ncamp];
         let mut open: Vec<bool> = vec![false; ncamp];
@@ -806,8 +877,9 @@ fn main() {
         let mut name: Vec<u8> = Vec::new();
         let mut raw: Vec<PRec> = Vec::new();
         let mut craw: Vec<CRec> = Vec::new();
-        let mut gk: Vec<u64> = Vec::new();
-        let mut gn: Vec<(u32, u32)> = Vec::new();
+        let mut rtmp: Vec<PRec> = Vec::new();
+        let mut ctmp: Vec<CRec> = Vec::new();
+        let mut gt: Vec<(u64, u32, u32)> = Vec::new();
         let mut eslot: Vec<u32> = Vec::new();
         let mut cslot: Vec<u32> = Vec::new();
         let mut groups: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
@@ -819,40 +891,58 @@ fn main() {
             let q = order[k];
             raw.clear();
             craw.clear();
-            for x in &resolved {
-                raw.extend_from_slice(&x.0[q]);
-                craw.extend_from_slice(&x.1[q]);
-            }
-            let cap = (raw.len() * 2 + 16).next_power_of_two();
-            let m = cap - 1;
-            gk.clear();
-            gk.resize(cap, 0);
-            gn.clear();
-            gn.resize(cap, (0, 0));
-            eslot.clear();
-            for r in &raw {
-                let mut h = mix(r.person) as usize & m;
-                loop {
-                    let k = gk[h];
-                    if k == r.person {
-                        break;
-                    }
-                    if k == 0 {
-                        gk[h] = r.person;
-                        break;
-                    }
-                    h = (h + 1) & m;
+            let (es, cs) = std::mem::take(&mut *rt[q].lock().unwrap());
+            for x in &es {
+                for c in x.chunks() {
+                    raw.extend_from_slice(c);
                 }
-                gn[h].0 += 1;
-                eslot.push(h as u32);
             }
+            for x in &cs {
+                for c in x.chunks() {
+                    craw.extend_from_slice(c);
+                }
+            }
+            drop((es, cs));
+            rsort(&mut raw, &mut rtmp, |r| r.ts);
+            rsort(&mut craw, &mut ctmp, |r| r.ts);
+            let mut cap = (raw.len() / 8 + 16).next_power_of_two();
+            'g: loop {
+                let m = cap - 1;
+                gt.clear();
+                gt.resize(cap, (0, 0, 0));
+                eslot.clear();
+                let mut np = 0usize;
+                for r in &raw {
+                    let mut h = mix(r.person) as usize & m;
+                    loop {
+                        let k = gt[h].0;
+                        if k == r.person {
+                            break;
+                        }
+                        if k == 0 {
+                            gt[h].0 = r.person;
+                            np += 1;
+                            if np * 2 > cap {
+                                cap *= 4;
+                                continue 'g;
+                            }
+                            break;
+                        }
+                        h = (h + 1) & m;
+                    }
+                    gt[h].1 += 1;
+                    eslot.push(h as u32);
+                }
+                break;
+            }
+            let m = cap - 1;
             cslot.clear();
             for r in &craw {
                 let mut h = mix(r.person) as usize & m;
                 loop {
-                    let k = gk[h];
+                    let k = gt[h].0;
                     if k == r.person {
-                        gn[h].1 += 1;
+                        gt[h].2 += 1;
                         cslot.push(h as u32);
                         break;
                     }
@@ -865,64 +955,42 @@ fn main() {
             }
             groups.clear();
             let (mut eo, mut co) = (0u32, 0u32);
-            for h in 0..cap {
-                if gk[h] != 0 {
-                    let (ne, nc) = gn[h];
-                    groups.push((gk[h], eo, ne, co, nc));
-                    gn[h] = (eo, co);
+            for g in gt.iter_mut() {
+                if g.0 != 0 {
+                    let (ne, nc) = (g.1, g.2);
+                    groups.push((g.0, eo, ne, co, nc));
+                    g.1 = eo;
+                    g.2 = co;
                     eo += ne;
                     co += nc;
                 }
             }
             ev.clear();
-            ev.resize(raw.len(), PRec { person: 0, ts: 0, meta: 0 });
+            ev.resize(raw.len(), (0, 0));
             for (r, &h) in raw.iter().zip(eslot.iter()) {
-                let o = &mut gn[h as usize].0;
-                ev[*o as usize] = *r;
+                let o = &mut gt[h as usize].1;
+                ev[*o as usize] = (r.ts, r.meta);
                 *o += 1;
             }
             cl.clear();
             cl.resize(co as usize, CRec { person: 0, cid: 0, ts: 0, camp: 0 });
             for (r, &h) in craw.iter().zip(cslot.iter()) {
                 if h != u32::MAX {
-                    let o = &mut gn[h as usize].1;
+                    let o = &mut gt[h as usize].2;
                     cl[*o as usize] = *r;
                     *o += 1;
                 }
             }
-            for g in groups.iter_mut() {
-                let (_, eo, ne, co, nc) = *g;
-                let es = &mut ev[eo as usize..(eo + ne) as usize];
-                if es.len() > 1 {
-                    es.sort_unstable_by_key(|r| ((r.ts as u64) << 32) | r.meta as u64);
-                }
-                let cs = &mut cl[co as usize..(co + nc) as usize];
-                if cs.len() > 1 {
-                    cs.sort_unstable_by(|a, b| {
-                        a.ts.cmp(&b.ts).then_with(|| {
-                            if a.cid == b.cid {
-                                std::cmp::Ordering::Equal
-                            } else if kless(a.cid, b.cid, &tab) {
-                                std::cmp::Ordering::Less
-                            } else {
-                                std::cmp::Ordering::Greater
-                            }
-                        })
-                    });
-                    let mut w = 1;
-                    for r in 1..cs.len() {
-                        if cs[r].cid != cs[w - 1].cid || cs[r].ts != cs[w - 1].ts {
-                            cs[w] = cs[r];
-                            w += 1;
-                        }
-                    }
-                    g.4 = w as u32;
-                }
+            for &(_, eo, ne, co, nc) in groups.iter() {
+                isort(&mut ev[eo as usize..(eo + ne) as usize], |r| r.0);
+                isort(&mut cl[co as usize..(co + nc) as usize], |r| r.ts);
             }
             for &(pk, eo, ne, co, nc) in groups.iter() {
                 let (i, j) = (eo as usize, (eo + ne) as usize);
                 let pc = &cl[co as usize..(co + nc) as usize];
                 starts.clear();
+                ad.clear();
+                sdi.clear();
                 name.clear();
                 dec_into(pk, &tab, &mut name);
                 let mut k = i;
@@ -955,18 +1023,15 @@ fn main() {
                     };
                 }
                 while k < j {
-                    let s = ev[k].ts;
+                    let s = ev[k].0;
                     let mut m = k + 1;
-                    while m < j && ev[m].ts - ev[m - 1].ts <= GAP_MS {
+                    while m < j && ev[m].0 - ev[m - 1].0 <= GAP_MS {
                         m += 1;
                     }
                     let day = ((base + s as i64).div_euclid(DAY_MS) - day0) as usize;
                     if day != cur {
                         flush!();
-                        let from = if cur == usize::MAX { 0 } else { cur + 1 };
-                        for d in from..=day {
-                            dstart[d] = starts.len();
-                        }
+                        ad.push((day as u32, starts.len() as u32));
                         cur = day;
                         ds = 0;
                         de = 0;
@@ -975,12 +1040,12 @@ fn main() {
                     }
                     let mut srev = 0i64;
                     let mut spur = false;
-                    for e in &ev[k..m] {
-                        if e.meta >> 31 != 0 {
-                            let pr = (e.meta & 0xFF_FFFF) as u64;
+                    for &(_, e) in &ev[k..m] {
+                        if e >> 31 != 0 {
+                            let pr = (e & 0xFF_FFFF) as u64;
                             srev += pr as i64;
                             spur = true;
-                            catrev[((e.meta >> 24) & 0x7F) as usize] += pr;
+                            catrev[((e >> 24) & 0x7F) as usize] += pr;
                         }
                     }
                     ds += 1;
@@ -988,35 +1053,36 @@ fn main() {
                     dr += srev;
                     dp |= spur;
                     while cp < pc.len() && pc[cp].ts <= s {
-                        if cp == 0 || pc[cp].ts != pc[cp - 1].ts {
+                        if cp == 0 || pc[cp].ts != pc[runi].ts || (pc[cp].cid != pc[runi].cid && kless(pc[cp].cid, pc[runi].cid, &tab)) {
                             runi = cp;
                         }
                         cp += 1;
                     }
                     let c = if cp > 0 && s - pc[runi].ts <= WEEK_MS { pc[runi].camp } else { organic };
-                    let sl = &mut camp[c as usize * ndays + day];
-                    sl[0] += 1;
-                    sl[1] += spur as u64;
-                    sl[2] += srev as u64;
+                    let ci = c as usize * ndays + day;
+                    camp[ci][0] += 1;
+                    if spur {
+                        camp[ci][1] += 1;
+                        crev[ci] += srev as u64;
+                    }
                     starts.push(s);
+                    sdi.push(ad.len() as u32 - 1);
                     k = m;
                 }
                 flush!();
-                for d in cur + 1..=ndays {
-                    dstart[d] = starts.len();
-                }
+                ad.push((0, starts.len() as u32));
                 if !pc.is_empty() {
-                    let emit = |c: u32, a: u32, b: u32, camp: &mut Vec<[u64; 4]>| {
+                    let emit = |c: u32, a: u32, b: u32, camp: &mut Vec<u32>| {
                         let x0 = starts.partition_point(|&s| s < a);
                         let x1 = starts.partition_point(|&s| s <= b);
                         if x0 >= x1 {
                             return;
                         }
-                        let d0 = ((base + starts[x0] as i64).div_euclid(DAY_MS) - day0) as usize;
-                        let d1 = ((base + starts[x1 - 1] as i64).div_euclid(DAY_MS) - day0) as usize;
-                        for d in d0..=d1 {
-                            let n = x1.min(dstart[d + 1]) - x0.max(dstart[d]);
-                            camp[c as usize * ndays + d][3] += n as u64;
+                        let (x0, x1) = (x0 as u32, x1 as u32);
+                        for k in sdi[x0 as usize]..=sdi[x1 as usize - 1] {
+                            let (d, b0) = ad[k as usize];
+                            let n = x1.min(ad[k as usize + 1].1) - x0.max(b0);
+                            camp[c as usize * ndays + d as usize] += n;
                         }
                     };
                     touched.clear();
@@ -1030,28 +1096,29 @@ fn main() {
                         } else if c.ts <= hi[ci] {
                             hi[ci] = c.ts + WEEK_MS;
                         } else {
-                            emit(c.camp, lo[ci], hi[ci], &mut camp);
+                            emit(c.camp, lo[ci], hi[ci], &mut casst);
                             lo[ci] = c.ts;
                             hi[ci] = c.ts + WEEK_MS;
                         }
                     }
                     for &c in &touched {
-                        emit(c, lo[c as usize], hi[c as usize], &mut camp);
+                        emit(c, lo[c as usize], hi[c as usize], &mut casst);
                         open[c as usize] = false;
                     }
                 }
             }
         }
-        (ur, camp)
+        (ur, camp, crev, casst)
     });
     lap("sessions");
 
     let mut tot = vec![[0u64; 4]; ncamp * ndays];
     for r in &results {
-        for (a, b) in tot.iter_mut().zip(r.1.iter()) {
-            for z in 0..4 {
-                a[z] += b[z];
-            }
+        for (i, a) in tot.iter_mut().enumerate() {
+            a[0] += r.1[i][0] as u64;
+            a[1] += r.1[i][1] as u64;
+            a[2] += r.2[i];
+            a[3] += r.3[i] as u64;
         }
     }
     let urs: Vec<&UserRows> = results.iter().map(|r| &r.0).collect();
