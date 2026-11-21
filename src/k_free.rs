@@ -1149,18 +1149,12 @@ unsafe fn ev_masks(p: *const u8) -> EvMasks {
         let (w1c, wbc, wn): (u64, u64, u64);
         const _: () = assert!(FB == 32);
         core::arch::asm!(
-            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
-            "vmovdqu {v2}, ymmword ptr [{p} + 64]",
-            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {c}, {v1}",
-            "vpcmpeqb {y}, {c}, {v2}",
-            "kunpckdq {a}, {b}, {a}",
-            "kunpckdq {y}, {y}, {b}",
-            "vpcmpeqb {x}, {n}, {v1}",
-            "vpcmpeqb {b}, {n}, {v2}",
-            "kunpckdq {x}, {b}, {x}",
-            a = out(kreg) w1c, b = out(kreg) _, x = out(kreg) wn, y = out(kreg) wbc, v1 = out(ymm_reg) _, v2 = out(ymm_reg) _,
-            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            "vmovdqu64 {v}, zmmword ptr [{p} + 32]",
+            "vpcmpeqb {a}, {c}, zmmword ptr [{p}]",
+            "vpcmpeqb {y}, {c}, {v}",
+            "vpcmpeqb {x}, {n}, {v}",
+            a = out(kreg) w1c, x = out(kreg) wn, y = out(kreg) wbc, v = out(zmm_reg) _,
+            c = in(zmm_reg) _mm512_set1_epi8(b',' as i8), n = in(zmm_reg) _mm512_set1_epi8(b'\n' as i8), p = in(reg) p,
             options(pure, readonly, nostack, preserves_flags)
         );
         EvMasks { w1c, wbc, wn }
@@ -1539,14 +1533,11 @@ unsafe fn ck_masks(p: *const u8) -> CkMasks {
     unsafe {
         let (c, n): (u64, u64);
         core::arch::asm!(
-            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
-            "kunpckdq {a}, {b}, {a}",
-            "vpcmpeqb {x}, {n}, ymmword ptr [{p}]",
-            "vpcmpeqb {b}, {n}, ymmword ptr [{p} + 32]",
-            "kunpckdq {x}, {b}, {x}",
-            a = out(kreg) c, b = out(kreg) _, x = out(kreg) n,
-            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            "vmovdqu64 {v}, zmmword ptr [{p}]",
+            "vpcmpeqb {a}, {v}, {c}",
+            "vpcmpeqb {x}, {v}, {n}",
+            a = out(kreg) c, x = out(kreg) n, v = out(zmm_reg) _,
+            c = in(zmm_reg) _mm512_set1_epi8(b',' as i8), n = in(zmm_reg) _mm512_set1_epi8(b'\n' as i8), p = in(reg) p,
             options(pure, readonly, nostack, preserves_flags)
         );
         CkMasks { c, n }
