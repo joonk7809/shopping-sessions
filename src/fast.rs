@@ -208,3 +208,16 @@ pub unsafe fn etype_p(p: *const u8, n: usize) -> u8 {
 
 pub const PAD: usize = 32;
 
+
+#[inline(always)]
+pub unsafe fn ing_p(p: *const u8) -> i64 {
+    let d = _mm_sub_epi8(ld(p), _mm_set1_epi8(48));
+    let a = _mm_maddubs_epi16(_mm_shuffle_epi8(d, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128)), _mm_set1_epi16(0x010A));
+    let b = _mm_madd_epi16(a, _mm_setr_epi16(100, 1, 32, 1, 3600, 60, 0, 0));
+    let x = _mm_cvtsi128_si64(b) as u64;
+    let hm = _mm_extract_epi32(b, 2) as i64;
+    let y = x as u32;
+    let md = (x >> 32) as u32;
+    let se = (*p.add(17) as i64 - 48) * 10 + *p.add(18) as i64 - 48;
+    days(y, md >> 5, md & 31) * 86400 + hm + se
+}

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
-use blk::Seq;
+use blk::{Seq, Wc};
 
 mod alloc;
 mod blk;
@@ -646,6 +646,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     let parsed: Vec<(Vec<Seq<ERec>>, Vec<Seq<CRec>>)> = run(nt, |_| {
         let mut ep: Vec<Seq<ERec>> = (0..np1).map(|_| Seq::new()).collect();
+        let mut ew = Wc::new(np1, ERec { eid: 0, person: 0, ingest: 0, ts: 0, meta: 0 });
         let mut cp: Vec<Seq<CRec>> = (0..np3).map(|_| Seq::new()).collect();
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -662,13 +663,21 @@ fn main() {
                         return;
                     }
                     let eid = fenc(end, f[0]);
-                    let ing = fts(end, f[3]);
+                    let g = f[3];
                     let mut r = ERec { eid, person: 0, ingest: i32::MAX, ts: INVALID, meta: 0 };
-                    if let Some(ig) = ing {
-                        if ig != i64::MAX {
-                            r.ingest = (ig.div_euclid(1000) - wstart / 1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
+                    let ing = if g.len() == 20 && g[19] == b'Z' {
+                        let sec = unsafe { fast::ing_p(g.as_ptr()) };
+                        r.ingest = (sec - wstart / 1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
+                        Some(sec * 1000)
+                    } else {
+                        let ing = fts(end, g);
+                        if let Some(ig) = ing {
+                            if ig != i64::MAX {
+                                r.ingest = (ig.div_euclid(1000) - wstart / 1000).clamp(i32::MIN as i64, i32::MAX as i64 - 1) as i32;
+                            }
                         }
-                    }
+                        ing
+                    };
                     let typ = if f[4].as_ptr() as usize + fast::PAD <= end {
                         unsafe { fast::etype_p(f[4].as_ptr(), f[4].len()) }
                     } else {
@@ -705,7 +714,7 @@ fn main() {
                             }
                         }
                     }
-                    ep[(mix(eid) >> (64 - P1_BITS)) as usize].push(r);
+                    ew.push((mix(eid) >> (64 - P1_BITS)) as usize, r, &mut ep);
                 });
             } else {
                 scan::tokenize::<4, _>(fb, |f4| {
@@ -725,6 +734,7 @@ fn main() {
                 });
             }
         }
+        ew.flush(&mut ep);
         (ep, cp)
     });
     let mut ept: Vec<Mutex<Vec<Seq<ERec>>>> = (0..np1).map(|_| Mutex::new(Vec::new())).collect();
@@ -742,56 +752,51 @@ fn main() {
     let next = AtomicUsize::new(0);
     let pparts: Vec<Vec<Seq<PRec>>> = run(nt, |_| {
         let mut out: Vec<Seq<PRec>> = (0..np3).map(|_| Seq::new()).collect();
-        let mut tk: Vec<u64> = Vec::new();
-        let mut tv: Vec<(i32, u32, u32)> = Vec::new();
-        let mut win: Vec<PRec> = Vec::new();
+        let mut flat: Vec<ERec> = Vec::new();
+        let mut ix: Vec<u32> = Vec::new();
         loop {
             let p = next.fetch_add(1, Relaxed);
             if p >= np1 {
                 break;
             }
             let parts = std::mem::take(&mut *ept[p].lock().unwrap());
-            let n: usize = parts.iter().map(|x| x.len()).sum();
-            let cap = (n * 2).next_power_of_two().max(16);
-            let m = cap - 1;
-            tk.clear();
-            tk.resize(cap, 0);
-            tv.clear();
-            tv.resize(cap, (0, 0, 0));
-            for (t, x) in parts.iter().enumerate() {
-                for (j, r) in x.iter().enumerate() {
-                    let eid = r.eid;
-                    let ing = r.ingest;
-                    let mut i = (mix(eid) as usize) & m;
-                    loop {
-                        let s = tk[i];
-                        if s == 0 {
-                            tk[i] = eid;
-                            tv[i] = (ing, t as u32, j as u32);
-                            break;
-                        }
-                        if s == eid {
-                            if ing < tv[i].0 {
-                                tv[i] = (ing, t as u32, j as u32);
-                            }
-                            break;
-                        }
-                        i = (i + 1) & m;
-                    }
-                }
-            }
-            for i in 0..cap {
-                if tk[i] != 0 {
-                    let (_, t, j) = tv[i];
-                    let r = parts[t as usize].at(j as usize);
-                    if r.ts != INVALID {
-                        win.push(PRec { person: r.person, ts: r.ts, meta: r.meta });
-                    }
+            flat.clear();
+            for x in parts.iter() {
+                for c in x.chunks() {
+                    flat.extend_from_slice(c);
                 }
             }
             drop(parts);
-            for w in win.drain(..) {
-                out[(mix(w.person) >> (64 - P3_BITS)) as usize].push(w);
+            let cap = (flat.len() * 2).next_power_of_two().max(16);
+            let m = cap - 1;
+            ix.clear();
+            ix.resize(cap, u32::MAX);
+            for (k, r) in flat.iter().enumerate() {
+                let eid = r.eid;
+                let mut i = (mix(eid) as usize) & m;
+                loop {
+                    let s = ix[i];
+                    if s == u32::MAX {
+                        ix[i] = k as u32;
+                        break;
+                    }
+                    let o = &flat[s as usize];
+                    if o.eid == eid {
+                        if r.ingest < o.ingest {
+                            ix[i] = k as u32;
+                        }
+                        break;
+                    }
+                    i = (i + 1) & m;
+                }
+            }
+            for &s in ix.iter() {
+                if s != u32::MAX {
+                    let r = flat[s as usize];
+                    if r.ts != INVALID {
+                        out[(mix(r.person) >> (64 - P3_BITS)) as usize].push(PRec { person: r.person, ts: r.ts, meta: r.meta });
+                    }
+                }
             }
         }
         out
