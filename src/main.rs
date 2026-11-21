@@ -863,9 +863,18 @@ fn main() {
     let mut order: Vec<usize> = (0..np3).collect();
     let sizes: Vec<usize> = rt.iter_mut().map(|r| r.get_mut().unwrap().0.iter().map(|x| x.len()).sum()).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
+    let ntot: usize = sizes.iter().sum();
     let next = AtomicUsize::new(0);
     let results: Vec<(UserRows, Vec<[u32; 2]>, Vec<u64>, Vec<u32>)> = run(nt, |_| {
         let mut ur = UserRows { uid: Vec::new(), uoff: vec![0], day: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new() };
+        let z = ntot / nt + 65536;
+        ur.uid.reserve(z * 12);
+        ur.uoff.reserve(z);
+        ur.day.reserve(z);
+        ur.sessions.reserve(z);
+        ur.events.reserve(z);
+        ur.revenue.reserve(z);
+        ur.top.reserve(z);
         let mut camp = vec![[0u32; 2]; ncamp * ndays];
         let mut casst = vec![0u32; ncamp * ndays];
         let mut crev = vec![0u64; ncamp * ndays];
