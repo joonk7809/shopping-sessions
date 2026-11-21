@@ -52,15 +52,12 @@ impl<'a> Ints<'a> {
             Ints::I64(x) => Ints::I64(&x[a..b]),
         }
     }
-    fn spec(self) -> bool {
-        matches!(self, Ints::U32(_) | Ints::I64(_))
-    }
 }
 
 #[derive(Clone, Copy)]
 enum Col<'a> {
     S(Strs<'a>),
-    I(Ints<'a>, i64, bool),
+    I(Ints<'a>, i64, bool, bool),
     C(&'a [u8], &'a [&'a [u8]]),
 }
 
@@ -436,12 +433,12 @@ impl Sink {
 fn slice<'a>(c: Col<'a>, a: usize, b: usize) -> Col<'a> {
     match c {
         Col::S(x) => Col::S(Strs { off: &x.off[a..=b], dat: x.dat }),
-        Col::I(x, k, d) => Col::I(x.slice(a, b), k, d),
+        Col::I(x, k, d, l) => Col::I(x.slice(a, b), k, d, l),
         Col::C(x, d) => Col::C(&x[a..b], d),
     }
 }
 
-fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<bool> {
+fn table(path: &Path, cols: &[(&str, Col)], n: usize) -> io::Result<()> {
     let t = T { b: Vec::with_capacity(1 << 16), last: 0, stack: Vec::new() };
     let mut s = Sink { f: File::create(path)?, pos: 0, t, buf: Vec::new() };
     s.put(&mut [IoSlice::new(b"PAR1")])?;
@@ -457,8 +454,8 @@ fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<
             match slice(c, a, b) {
                 Col::S(x) => s.strs(x, &mut ls, &mut m)?,
                 Col::C(x, d) => s.cats(x, d, &mut nn, &mut m)?,
-                Col::I(x, k, _) => {
-                    let el = if wide && x.spec() { 8 } else { 4 };
+                Col::I(x, k, _, l) => {
+                    let el = if l { 8 } else { 4 };
                     let ok = match x {
                         Ints::U8(x) => s.ints(x, k, el, &mut m)?,
                         Ints::U16(x) => s.ints(x, k, el, &mut m)?,
@@ -467,7 +464,7 @@ fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<
                         Ints::I64(x) => s.ints(x, k, el, &mut m)?,
                     };
                     if !ok {
-                        return Ok(false);
+                        return Err(io::Error::other("int32 overflow"));
                     }
                 }
             }
@@ -479,7 +476,7 @@ fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<
     }
     let ty = |c: &Col| match c {
         Col::S(_) | Col::C(..) => 6,
-        Col::I(x, ..) => 1 + (wide && x.spec()) as i32,
+        Col::I(_, _, _, l) => 1 + *l as i32,
     };
     let t = &mut s.t;
     t.b.clear();
@@ -497,7 +494,7 @@ fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<
         t.bin(4, name.as_bytes());
         let logical = match c {
             Col::S(_) | Col::C(..) => 1,
-            Col::I(_, _, d) => 6 * *d as i16,
+            Col::I(_, _, d, _) => 6 * *d as i16,
         };
         if logical != 0 {
             t.i32(6, if logical == 1 { 0 } else { 6 });
@@ -545,7 +542,7 @@ fn table(path: &Path, cols: &[(&str, Col)], n: usize, wide: bool) -> io::Result<
     let len = (t.b.len() as u32).to_le_bytes();
     let foot = std::mem::take(&mut t.b);
     s.put(&mut [IoSlice::new(&foot), IoSlice::new(&len), IoSlice::new(b"PAR1")])?;
-    Ok(true)
+    Ok(())
 }
 
 fn files(dir: &Path, tag: &str, cols: &[(&str, Col)], n: usize, k: usize) -> io::Result<()> {
@@ -557,10 +554,7 @@ fn files(dir: &Path, tag: &str, cols: &[(&str, Col)], n: usize, k: usize) -> io:
                 sc.spawn(move || {
                     let part: Vec<(&str, Col)> = cols.iter().map(|&(nm, c)| (nm, slice(c, a, b))).collect();
                     let path = dir.join(format!("{tag}{i}.parquet"));
-                    if !table(&path, &part, b - a, false)? {
-                        table(&path, &part, b - a, true)?;
-                    }
-                    Ok(())
+                    table(&path, &part, b - a)
                 })
             })
             .collect();
@@ -571,10 +565,10 @@ fn files(dir: &Path, tag: &str, cols: &[(&str, Col)], n: usize, k: usize) -> io:
 pub fn user_daily(dir: &Path, tag: &str, x: &UserDaily, n: usize, k: usize) -> io::Result<()> {
     let cols = [
         ("user_id", Col::S(x.user_id)),
-        ("day", Col::I(x.day, x.day_base as i64, true)),
-        ("sessions", Col::I(x.sessions, 0, false)),
-        ("events", Col::I(x.events, 0, false)),
-        ("revenue_cents", Col::I(x.revenue_cents, 0, false)),
+        ("day", Col::I(x.day, x.day_base as i64, true, false)),
+        ("sessions", Col::I(x.sessions, 0, false, false)),
+        ("events", Col::I(x.events, 0, false, false)),
+        ("revenue_cents", Col::I(x.revenue_cents, 0, false, true)),
         ("top_category", Col::C(x.top_category, x.categories)),
     ];
     files(dir, tag, &cols, n, k)
@@ -584,11 +578,11 @@ pub fn campaign_daily(dir: &Path, tag: &str, x: &CampaignDaily, n: usize, k: usi
     let cols = [
         ("campaign_id", Col::S(x.campaign_id)),
         ("channel", Col::S(x.channel)),
-        ("day", Col::I(x.day, x.day_base as i64, true)),
-        ("sessions", Col::I(x.sessions, 0, false)),
-        ("purchasing_sessions", Col::I(x.purchasing_sessions, 0, false)),
-        ("revenue_cents", Col::I(x.revenue_cents, 0, false)),
-        ("assisted_sessions", Col::I(x.assisted_sessions, 0, false)),
+        ("day", Col::I(x.day, x.day_base as i64, true, false)),
+        ("sessions", Col::I(x.sessions, 0, false, false)),
+        ("purchasing_sessions", Col::I(x.purchasing_sessions, 0, false, false)),
+        ("revenue_cents", Col::I(x.revenue_cents, 0, false, true)),
+        ("assisted_sessions", Col::I(x.assisted_sessions, 0, false, false)),
     ];
     files(dir, tag, &cols, n, k)
 }
