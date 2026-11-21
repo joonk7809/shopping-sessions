@@ -15,6 +15,11 @@ fn popw() -> bool {
     *POPW.get_or_init(|| !std::env::var("XL_POPW").is_ok_and(|v| v == "0"))
 }
 const MADV_POPULATE_WRITE: i32 = 23;
+const MADV_POPULATE_READ: i32 = 22;
+static POPR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn popr() -> bool {
+    *POPR.get_or_init(|| !std::env::var("XL_POPR").is_ok_and(|v| v == "0"))
+}
 #[cfg(feature = "knobs")]
 pub static mut NOSINK: bool = false;
 #[cfg(feature = "knobs")]
@@ -1933,6 +1938,10 @@ pub fn stage1(g: &G, tid: usize) {
             continue;
         }
         let buf = &data[s..e];
+        if popr() {
+            let a = buf.as_ptr() as usize & !4095;
+            unsafe { madvise(a as *mut u8, buf.as_ptr() as usize + buf.len() - a, MADV_POPULATE_READ) };
+        }
         if unsafe { SKIP } & 512 != 0 {
             let mut x = 0u64;
             let mut i = 0;
